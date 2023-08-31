@@ -1,0 +1,38 @@
+name: 'Unleash Feature Flags'
+description: 'Lets you use the getunleash.io feature flags management solution in GitHub Actions'
+inputs:
+  app-name:
+    description: 'The application name for the GitHub Action as you want it to appear in Unleash metrics'
+    type: 'string'
+    required: true
+  api-key:
+    description: 'The frontend API token to use with Unleash'
+    type: 'string'
+    required: true
+  url:
+    description: 'Url to Unleash proxy or frontend api'
+    type: 'string'
+    required: true
+  environment:
+    description: 'The environment for which to evaluate the feature flags'
+    type: 'string'
+    required: false
+    default: 'default'
+  is-enabled:
+    description: 'Newline-separated list of feature flag names to evaluate'
+    type: 'string'
+    required: false
+  get-variant:
+    description: 'Newline-separated list of feature flag names to get variants for'
+    type: 'string'
+    required: false
+  context:
+    description: 'Multiline list of key=value pairs that will be string split on ='
+    type: 'string'
+    required: false
+outputs:
+  the-value:
+    description: 'What we found in the input'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
