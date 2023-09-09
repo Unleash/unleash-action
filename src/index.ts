@@ -1,4 +1,4 @@
-import { createUnleashAction } from "./unleash-action";
+import { createUnleashAction } from './unleash-action';
 import { getInput, getMultilineInput, setOutput } from '@actions/core';
 
 const appName = getInput('app-name');
@@ -8,7 +8,7 @@ const environment = getInput('environment');
 
 const context: Record<string, string> = {};
 const contextLines = getMultilineInput('context');
-contextLines?.forEach(l => {
+contextLines?.forEach((l) => {
     let keyVal = l.split('=');
     context[keyVal[0]] = keyVal[1];
 });
@@ -24,7 +24,7 @@ createUnleashAction({
     context: context,
     features: features,
     variants: variants,
-    setResult: setOutput
+    setResult: setOutput,
 }).then(() => {
-  console.log("Done!");
+    console.log('Done!');
 });
