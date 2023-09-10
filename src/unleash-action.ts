@@ -103,7 +103,13 @@ export class UnleashAction {
             }
             this.metrics.count(featureName, variant.enabled);
             this.setResult(featureName, variant.enabled);
-            this.setResult(`${featureName}_variant`, variant.payload?.value);
+
+            if (variant.enabled) {
+                this.setResult(
+                    `${featureName}_variant`,
+                    variant.payload?.value,
+                );
+            }
         });
     }
 }
