@@ -10,7 +10,7 @@ inputs:
     type: 'string'
     required: true
   url:
-    description: 'Url to Unleash proxy or frontend api'
+    description: 'URL to Unleash Edge or frontend API'
     type: 'string'
     required: true
   environment:
