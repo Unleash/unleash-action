@@ -4,7 +4,6 @@ import { getInput, getMultilineInput, setOutput } from '@actions/core';
 const appName = getInput('app-name');
 const url = getInput('url');
 const clientKey = getInput('api-key');
-const environment = getInput('environment');
 
 const context: Record<string, string> = {};
 const contextLines = getMultilineInput('context');
@@ -20,7 +19,6 @@ createUnleashAction({
     url: url,
     clientKey: clientKey,
     appName: appName,
-    environment: environment,
     context: context,
     features: features,
     variants: variants,
