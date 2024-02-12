@@ -5,7 +5,6 @@ interface ICreateUnleashActionOptions {
     url: string;
     clientKey: string;
     appName: string;
-    environment: string;
     context: Record<string, string>;
     features?: string[];
     variants?: string[];
@@ -41,7 +40,6 @@ const createClient = (options: ICreateUnleashActionOptions): UnleashClient => {
         appName: options.appName,
         url: options.url,
         clientKey: options.clientKey,
-        environment: options.environment,
         refreshInterval: 0,
         metricsInterval: 0,
         disableMetrics: true,
