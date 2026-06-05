@@ -21,7 +21,6 @@ Begin by adding a step to your workflow yaml file that references Unleash/unleas
         app-name: my-workflow
         url: http://localhost/api/frontend 
         api-key: ${{ secrets.YOUR_SECRET_API_KEY }}
-        environment: development
         get-variant: your-feature-name
         is-enabled: a-feature-name
         context: |-
@@ -58,7 +57,6 @@ Options to use when configuring the Unleash-action:
 | app-name   | yes | n/a | The application name for the GitHub Action as you want it to appear in Unleash metrics | 
 | api-key   | yes | n/a | The frontend API token to use with Unleash - We recommend you store this in a secret and reference the variable here | 
 | url   | yes | n/a | The Unleash Proxy URL to connect to. E.g.: `https://examples.com/proxy` | 
-| environment   | no | n/a | The Unleash environment for which to evaluate the feature flags | 
 | is-enabled   | no | n/a | Newline-separated multiline string with feature flag names to evaluate | 
 | get-variant   | no | n/a | Newline-separated multiline string with feature flag names to get variants for | 
 | context   | no | n/a | Multiline list of key=value context and custom parameter pairs that will be string split on = | 
