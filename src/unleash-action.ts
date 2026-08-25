@@ -59,7 +59,7 @@ export class UnleashAction {
         this.metrics = options.metrics;
 
         this.unleash.on('ready', () => {
-            console.log('Ready!');
+            info('Ready!');
         });
 
         this.features = options.features || [];
