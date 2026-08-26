@@ -1,4 +1,5 @@
 import { fetch } from './fetch.cjs';
+import { info } from '@actions/core';
 
 interface MetricsOptions {
     headerName: string;
@@ -83,7 +84,7 @@ export class Metrics {
                 headers: this.getHeaders(),
             });
         } catch (e) {
-            console.error('Unleash: unable to send feature metrics', e);
+            info(`Unleash: unable to send feature metrics. ${e}`);
         }
     }
 
