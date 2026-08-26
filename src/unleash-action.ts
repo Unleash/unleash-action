@@ -21,8 +21,12 @@ export const createUnleashAction = async (
     const client = createClient(options);
     client.updateContext(options.context);
     const action = new UnleashAction({ ...options, client });
-    await action.run();
-    await action.end();
+
+    try {
+        await action.run();
+    } finally {
+        await action.end();
+    }
 };
 
 const createClient = (options: ICreateUnleashActionOptions): UnleashClient => {
