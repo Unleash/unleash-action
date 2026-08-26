@@ -1,3 +1,4 @@
+import { jest, test, expect } from '@jest/globals';
 import { UnleashAction } from '../src/unleash-action';
 
 test('checks features', async () => {
@@ -12,14 +13,9 @@ test('checks features', async () => {
         return { name: 'variant-1', payload: {} };
     };
 
-    const metrics = {};
-    metrics.count = () => {};
-    metrics.countVariant = () => {};
-    metrics.sendMetrics = () => {};
     let resultSet = false;
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
@@ -51,14 +47,9 @@ test('checks variants', async () => {
         };
     };
 
-    const metrics = {};
-    metrics.count = () => {};
-    metrics.countVariant = () => {};
-    metrics.sendMetrics = () => {};
     let resultSets = [];
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
@@ -80,15 +71,13 @@ test('checks variants', async () => {
     );
 });
 
-test('end calls sendMetrics and stop', async () => {
+test('end sends metrics and stops the client', async () => {
     const unleash = {};
-    unleash.stop = jest.fn();
     unleash.on = () => {};
-    const metrics = {};
-    metrics.sendMetrics = jest.fn();
+    unleash.sendMetrics = jest.fn();
+    unleash.stop = jest.fn();
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
@@ -98,11 +87,11 @@ test('end calls sendMetrics and stop', async () => {
     });
 
     await action.end();
-    expect(metrics.sendMetrics).toBeCalled();
-    expect(unleash.stop).toBeCalled();
+    expect(unleash.sendMetrics).toHaveBeenCalled();
+    expect(unleash.stop).toHaveBeenCalled();
 });
 
-test('counts features and variants', async () => {
+test('sets results for multiple features and variants', async () => {
     const unleash = {};
     unleash.isEnabled = () => {
         return true;
@@ -118,24 +107,23 @@ test('counts features and variants', async () => {
         };
     };
 
-    const metrics = {};
-    metrics.count = jest.fn();
-    metrics.countVariant = jest.fn();
-    metrics.sendMetrics = () => {};
+    const setResult = jest.fn();
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
         context: {},
         features: ['feature-1', 'feature-2'],
         variants: ['variant-1'],
-        setResult: (name, value) => {},
+        setResult,
     });
     await action.run();
-    expect(metrics.countVariant).toBeCalled();
-    expect(metrics.count).toBeCalledTimes(3);
+    expect(setResult).toHaveBeenCalledWith('feature-1', true);
+    expect(setResult).toHaveBeenCalledWith('feature-2', true);
+    expect(setResult).toHaveBeenCalledWith('variant-1', true);
+    expect(setResult).toHaveBeenCalledWith('variant-1_variant', 'red');
+    expect(setResult).toHaveBeenCalledTimes(4);
 });
 
 test('doesnt set variant result if variant is not enabled', async () => {
@@ -154,14 +142,9 @@ test('doesnt set variant result if variant is not enabled', async () => {
         };
     };
 
-    const metrics = {};
-    metrics.count = jest.fn();
-    metrics.countVariant = jest.fn();
-    metrics.sendMetrics = () => {};
     const setResult = jest.fn();
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
@@ -170,9 +153,8 @@ test('doesnt set variant result if variant is not enabled', async () => {
         setResult,
     });
     await action.run();
-    expect(metrics.countVariant).toBeCalled();
-    expect(metrics.count).toBeCalledTimes(1);
-    expect(setResult).toBeCalledTimes(1);
+    expect(setResult).toHaveBeenCalledTimes(1);
+    expect(setResult).toHaveBeenCalledWith('variant-1', false);
     expect(setResult).not.toHaveBeenCalledWith('variant-1_variant');
 });
 
@@ -192,14 +174,9 @@ test('sets feature result to false if feature is not enabled', async () => {
         };
     };
 
-    const metrics = {};
-    metrics.count = jest.fn();
-    metrics.countVariant = jest.fn();
-    metrics.sendMetrics = () => {};
     const setResult = jest.fn();
     const action = new UnleashAction({
         client: unleash,
-        metrics,
         url: 'http://localhost:3000',
         clientKey: 'client-1',
         appName: 'test-app',
@@ -208,7 +185,6 @@ test('sets feature result to false if feature is not enabled', async () => {
         setResult,
     });
     await action.run();
-    expect(metrics.count).toBeCalledTimes(1);
-    expect(setResult).toBeCalledTimes(1);
+    expect(setResult).toHaveBeenCalledTimes(1);
     expect(setResult).toHaveBeenCalledWith('feature-1', false);
 });
