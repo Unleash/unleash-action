@@ -31,7 +31,6 @@ const createClient = (options: ICreateUnleashActionOptions): UnleashClient => {
         clientKey: options.clientKey,
         refreshInterval: 0,
         metricsInterval: 0,
-        disableMetrics: true,
     });
 };
 
