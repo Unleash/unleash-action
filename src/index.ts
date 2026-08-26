@@ -1,5 +1,5 @@
 import { createUnleashAction } from './unleash-action';
-import { getInput, getMultilineInput, setOutput } from '@actions/core';
+import { getInput, getMultilineInput, setOutput, info } from '@actions/core';
 
 const appName = getInput('app-name');
 const url = getInput('url');
@@ -24,5 +24,5 @@ createUnleashAction({
     variants: variants,
     setResult: setOutput,
 }).then(() => {
-    console.log('Done!');
+    info('Done!');
 });

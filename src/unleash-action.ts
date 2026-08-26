@@ -1,4 +1,5 @@
 import { UnleashClient } from 'unleash-proxy-client';
+import { info } from '@actions/core';
 
 interface ICreateUnleashActionOptions {
     url: string;
@@ -44,7 +45,7 @@ export class UnleashAction {
         this.unleash = options.client;
 
         this.unleash.on('ready', () => {
-            console.log('Ready!');
+            info('Ready!');
         });
 
         this.features = options.features || [];
@@ -53,21 +54,21 @@ export class UnleashAction {
     }
 
     async run(): Promise<void> {
-        console.log('starting.');
+        info('starting.');
         await this.unleash.start();
 
-        console.log('Checking features.');
+        info('Checking features.');
         await this.checkFeatures();
 
-        console.log('Checking variants.');
+        info('Checking variants.');
         await this.checkVariants();
     }
 
     async end(): Promise<void> {
-        console.log('Sending metrics disabled.');
+        info('Sending metrics.');
         // TODO: replace with later Unleash versions metrics handling
 
-        console.log('Stopping.');
+        info('Stopping.');
         await this.unleash.stop();
     }
 

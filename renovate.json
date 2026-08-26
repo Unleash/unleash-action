@@ -2,5 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ]
+  ],
+  "packageRules": [
+    {
+      "minimumReleaseAge": "7 days",
+      "internalChecksFilter": "strict"
+    }
+  ],
+  "labels": ["dependencies"]
 }
