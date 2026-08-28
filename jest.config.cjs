@@ -1,7 +1,11 @@
 module.exports = {
-    preset: 'ts-jest',
+    testEnvironment: 'node',
+    extensionsToTreatAsEsm: ['.ts'],
     transform: {
-      '^.+\\.(ts|tsx)?$': 'ts-jest',
-      '^.+\\.(js|jsx)$': 'babel-jest'
-    }
-  };
+        '^.+\\.(ts|tsx)?$': [
+            'ts-jest',
+            { useESM: true, tsconfig: { module: 'ESNext', moduleResolution: 'bundler' } },
+        ],
+        '^.+\\.(js|jsx)$': 'babel-jest',
+    },
+};

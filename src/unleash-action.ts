@@ -20,8 +20,12 @@ export const createUnleashAction = async (
 ): Promise<void> => {
     const client = createClient(options);
     const action = new UnleashAction({ ...options, client });
-    await action.run();
-    await action.end();
+
+    try {
+        await action.run();
+    } finally {
+        await action.end();
+    }
 };
 
 const createClient = (options: ICreateUnleashActionOptions): UnleashClient => {
@@ -31,7 +35,7 @@ const createClient = (options: ICreateUnleashActionOptions): UnleashClient => {
         clientKey: options.clientKey,
         refreshInterval: 0,
         metricsInterval: 0,
-        disableMetrics: true,
+        context: options.context,
     });
 };
 
@@ -54,7 +58,7 @@ export class UnleashAction {
     }
 
     async run(): Promise<void> {
-        info('starting.');
+        info('Starting Unleash.');
         await this.unleash.start();
 
         info('Checking features.');
@@ -66,10 +70,10 @@ export class UnleashAction {
 
     async end(): Promise<void> {
         info('Sending metrics.');
-        // TODO: replace with later Unleash versions metrics handling
+        await this.unleash.sendMetrics();
 
-        info('Stopping.');
-        await this.unleash.stop();
+        info('Stopping Unleash.');
+        this.unleash.stop();
     }
 
     private async checkFeatures(): Promise<void> {
