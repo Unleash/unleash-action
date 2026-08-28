@@ -29,5 +29,5 @@ outputs:
   the-value:
     description: 'What we found in the input'
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
