@@ -1,5 +1,6 @@
+import { createServer } from 'node:http';
 import { jest, test, expect } from '@jest/globals';
-import { UnleashAction } from '../src/unleash-action';
+import { UnleashAction, createUnleashAction } from '../src/unleash-action';
 
 test('checks features', async () => {
     const unleash = {};
@@ -187,4 +188,105 @@ test('sets feature result to false if feature is not enabled', async () => {
     await action.run();
     expect(setResult).toHaveBeenCalledTimes(1);
     expect(setResult).toHaveBeenCalledWith('feature-1', false);
+});
+
+const startMockUnleashServer = (toggles) => {
+    const metricsRequests = [];
+
+    const server = createServer((req, res) => {
+        if (req.method === 'GET' && req.url.startsWith('/frontend')) {
+            if (req.headers.authorization !== 'client-1') {
+                res.writeHead(401);
+                res.end();
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ toggles }));
+            return;
+        }
+
+        if (req.method === 'POST' && req.url === '/frontend/client/metrics') {
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+            });
+            req.on('end', () => {
+                metricsRequests.push(JSON.parse(body));
+                res.writeHead(200);
+                res.end();
+            });
+            return;
+        }
+
+        res.writeHead(404);
+        res.end();
+    });
+
+    return new Promise((resolve) => {
+        server.listen(0, () => {
+            const { port } = server.address();
+            resolve({
+                url: `http://localhost:${port}/frontend`,
+                metricsRequests,
+                close: () => new Promise((r) => server.close(r)),
+            });
+        });
+    });
+};
+
+test('integration: runs the full action against a real local Unleash frontend server', async () => {
+    const { url, metricsRequests, close } = await startMockUnleashServer([
+        {
+            name: 'feature-1',
+            enabled: true,
+            variant: { name: 'disabled', enabled: false },
+            impressionData: false,
+        },
+        {
+            name: 'variant-1',
+            enabled: true,
+            variant: {
+                name: 'variant-a',
+                enabled: true,
+                payload: { type: 'string', value: 'red' },
+            },
+            impressionData: false,
+        },
+    ]);
+
+    const results = {};
+    try {
+        await createUnleashAction({
+            url,
+            clientKey: 'client-1',
+            appName: 'test-app',
+            context: {},
+            features: ['feature-1'],
+            variants: ['variant-1'],
+            setResult: (name, value) => {
+                results[name] = value;
+            },
+        });
+    } finally {
+        await close();
+    }
+
+    expect(results).toEqual({
+        'feature-1': true,
+        'variant-1': true,
+        'variant-1_variant': 'red',
+    });
+
+    expect(metricsRequests).toHaveLength(1);
+    expect(metricsRequests[0].appName).toBe('test-app');
+    expect(metricsRequests[0].bucket.toggles['feature-1']).toEqual(
+        expect.objectContaining({ yes: 1, no: 0 }),
+    );
+    expect(metricsRequests[0].bucket.toggles['variant-1']).toEqual(
+        expect.objectContaining({
+            yes: 1,
+            no: 0,
+            variants: { 'variant-a': 1 },
+        }),
+    );
 });
