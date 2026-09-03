@@ -1,5 +1,5 @@
-import { UnleashClient } from 'unleash-proxy-client';
 import { info } from '@actions/core';
+import { UnleashClient } from 'unleash-proxy-client';
 
 interface ICreateUnleashActionOptions {
     url: string;

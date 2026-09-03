@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
-import { jest, test, expect } from '@jest/globals';
-import { UnleashAction, createUnleashAction } from '../src/unleash-action';
+import { expect, jest, test } from '@jest/globals';
+import { createUnleashAction, UnleashAction } from '../src/unleash-action';
 
 test('checks features', async () => {
     const unleash = {};
@@ -48,7 +48,7 @@ test('checks variants', async () => {
         };
     };
 
-    let resultSets = [];
+    const resultSets = [];
     const action = new UnleashAction({
         client: unleash,
         url: 'http://localhost:3000',

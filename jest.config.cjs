@@ -4,7 +4,10 @@ module.exports = {
     transform: {
         '^.+\\.(ts|tsx)?$': [
             'ts-jest',
-            { useESM: true, tsconfig: { module: 'ESNext', moduleResolution: 'bundler' } },
+            {
+                useESM: true,
+                tsconfig: { module: 'ESNext', moduleResolution: 'bundler' },
+            },
         ],
         '^.+\\.(js|jsx)$': 'babel-jest',
     },
