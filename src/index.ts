@@ -1,5 +1,5 @@
+import { getInput, getMultilineInput, info, setOutput } from '@actions/core';
 import { createUnleashAction } from './unleash-action';
-import { getInput, getMultilineInput, setOutput, info } from '@actions/core';
 
 const appName = getInput('app-name');
 const url = getInput('url');
@@ -8,7 +8,7 @@ const clientKey = getInput('api-key');
 const context: Record<string, string> = {};
 const contextLines = getMultilineInput('context');
 contextLines?.forEach((l) => {
-    let keyVal = l.split('=');
+    const keyVal = l.split('=');
     context[keyVal[0]] = keyVal[1];
 });
 
