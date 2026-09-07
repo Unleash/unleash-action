@@ -7,7 +7,7 @@ This allows you to use killswitches, release-toggles, variants and more to guide
 
 #### Set up
 
-Begin by adding a step to your workflow yaml file that references Unleash/unleash-action, giving it an id unique to that step, and set up options:  
+Begin by adding a step to your workflow yaml file that references Unleash/unleash-action@v1, giving it an id unique to that step, and set up options:  
 [Available options](#available-options)
 
 
@@ -16,7 +16,7 @@ Begin by adding a step to your workflow yaml file that references Unleash/unleas
     # ...
     - name: Unleash feature management
       id: featureflags
-      uses: Unleash/unleash-action
+      uses: Unleash/unleash-action@v1
       with: 
         app-name: my-workflow
         url: http://localhost/api/frontend 
