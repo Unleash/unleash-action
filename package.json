@@ -8,7 +8,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "release": "ncc build src/index.ts --license licenses.txt -o dist",
+    "release": "tsc && ncc build build/src/index.js --license licenses.txt -o dist",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "lint": "biome check .",
     "lint:fix": "biome check . --write"
