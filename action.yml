@@ -2,17 +2,17 @@ name: 'Unleash Feature Flags'
 description: 'Lets you use the getunleash.io feature flags management solution in GitHub Actions'
 inputs:
   app-name:
-    description: 'The application name for the GitHub Action as you want it to appear in Unleash metrics'
+    description: 'The application name for the GitHub Action as you want it to appear in Unleash metrics. Required for is-enabled/get-variant'
     type: 'string'
-    required: true
+    required: false
   api-key:
-    description: 'The frontend API token to use with Unleash'
+    description: 'The frontend API token to use with Unleash. Required for is-enabled/get-variant'
     type: 'string'
-    required: true
+    required: false
   url:
-    description: 'URL to Unleash Edge or frontend API'
+    description: 'URL to Unleash Edge or frontend API. Required for is-enabled/get-variant'
     type: 'string'
-    required: true
+    required: false
   is-enabled:
     description: 'Newline-separated list of feature flag names to evaluate'
     type: 'string'
@@ -25,6 +25,40 @@ inputs:
     description: 'Multiline list of key=value pairs that will be string split on ='
     type: 'string'
     required: false
+  admin-url:
+    description: 'Base URL of the Unleash server (e.g. https://unleash.example.com). Required for enable/disable/set-variant'
+    type: 'string'
+    required: false
+  admin-api-key:
+    description: 'Admin API token or personal access token with permission to update flags. Required for enable/disable/set-variant'
+    type: 'string'
+    required: false
+  project:
+    description: 'Unleash project the flags belong to (used by enable/disable/set-variant)'
+    type: 'string'
+    required: false
+    default: 'default'
+  environment:
+    description: 'Unleash environment to change (e.g. development, production). Required for enable/disable/set-variant'
+    type: 'string'
+    required: false
+  enable:
+    description: 'Newline-separated list of feature flag names to turn on in the environment'
+    type: 'string'
+    required: false
+  disable:
+    description: 'Newline-separated list of feature flag names to turn off in the environment'
+    type: 'string'
+    required: false
+  set-variant:
+    description: 'Newline-separated list of flag=variant or flag=variant:payload. Replaces the environment variants of the flag with this single variant (weight 100%)'
+    type: 'string'
+    required: false
+  variant-payload-type:
+    description: 'Payload type for set-variant payloads: string, json, csv or number'
+    type: 'string'
+    required: false
+    default: 'string'
 outputs:
   the-value:
     description: 'What we found in the input'

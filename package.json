@@ -8,24 +8,24 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "release": "ncc build src/index.ts --license licenses.txt -o dist",
+    "release": "tsc && ncc build build/src/index.js --license licenses.txt -o dist",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "lint": "biome check .",
     "lint:fix": "biome check . --write"
   },
   "dependencies": {
     "@actions/core": "^3.0.1",
-    "unleash-proxy-client": "^3.8.2"
+    "unleash-proxy-client": "^3.8.3"
   },
   "devDependencies": {
-    "@babel/preset-env": "^7.29.7",
-    "@biomejs/biome": "2.5.10",
-    "@jest/globals": "^30.4.1",
-    "@types/node": "26.2.0",
+    "@babel/preset-env": "^8.0.7",
+    "@babel/preset-typescript": "^8.0.7",
+    "@biomejs/biome": "2.6.9",
+    "@jest/globals": "^30.5.2",
+    "@types/node": "26.6.10",
     "@vercel/ncc": "^0.45.0",
-    "babel-jest": "^30.4.1",
-    "jest": "^30.4.2",
-    "ts-jest": "^29.4.12",
-    "typescript": "^6.0.3"
+    "babel-jest": "^30.5.2",
+    "jest": "^30.5.2",
+    "typescript": "^7.0.2"
   }
 }
