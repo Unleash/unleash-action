@@ -1,14 +1,10 @@
 module.exports = {
     testEnvironment: 'node',
     extensionsToTreatAsEsm: ['.ts'],
+    moduleNameMapper: {
+        '^(\\.{1,2}/.*)\\.js$': '$1',
+    },
     transform: {
-        '^.+\\.(ts|tsx)?$': [
-            'ts-jest',
-            {
-                useESM: true,
-                tsconfig: { module: 'ESNext', moduleResolution: 'bundler' },
-            },
-        ],
-        '^.+\\.(js|jsx)$': 'babel-jest',
+        '^.+\\.(ts|tsx|js|jsx)$': 'babel-jest',
     },
 };
