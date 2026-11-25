@@ -3245,11 +3245,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -4387,7 +4453,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -4406,11 +4472,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -5148,7 +5218,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -5183,9 +5253,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -5442,8 +5513,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -5592,7 +5661,7 @@ async function connectH1 (client, socket) {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -5601,15 +5670,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -5758,12 +5835,22 @@ function writeH1 (client, request) {
   const socket = client[kSocket]
   clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -6220,6 +6307,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(4589)
+const { errorMonitor } = __nccwpck_require__(8474)
 const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
@@ -6296,6 +6384,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -6345,8 +6442,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -6420,8 +6515,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -6516,22 +6609,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -6550,25 +6653,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -7077,9 +7212,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -7600,6 +7736,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -7612,6 +7749,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -7622,12 +7760,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -9267,6 +9412,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -9277,6 +9423,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -9367,7 +9527,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -9436,8 +9601,15 @@ class RetryHandler {
 
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -9449,6 +9621,7 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
@@ -9487,6 +9660,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -9526,7 +9700,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -13960,6 +14134,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -13983,6 +14158,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -14024,11 +14256,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -14039,6 +14281,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -14050,6 +14293,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -14067,92 +14316,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -14165,10 +14350,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -14184,19 +14368,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -14210,22 +14392,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -14233,15 +14416,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -14258,65 +14454,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -14345,12 +14548,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -14377,6 +14727,7 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -14658,6 +15009,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -14836,7 +15188,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -19932,8 +20285,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -20102,8 +20457,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -20121,7 +20474,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -20153,6 +20506,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -20198,10 +20553,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -25619,7 +25970,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -26380,7 +26731,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -26673,6 +27029,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -31070,7 +31440,7 @@ function core_debug(message) {
  * @param properties optional properties to add to the annotation.
  */
 function error(message, properties = {}) {
-    issueCommand('error', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    command_issueCommand('error', utils_toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 /**
  * Adds a warning issue
@@ -31078,7 +31448,7 @@ function error(message, properties = {}) {
  * @param properties optional properties to add to the annotation.
  */
 function warning(message, properties = {}) {
-    issueCommand('warning', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+    command_issueCommand('warning', utils_toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 /**
  * Adds a notice issue
@@ -31181,10 +31551,10 @@ function getIDToken(aud) {
 
 //# sourceMappingURL=core.js.map
 ;// CONCATENATED MODULE: ./node_modules/unleash-proxy-client/build/main.esm.js
-var t=function(e,r){return t=Object.setPrototypeOf||{__proto__:[]}instanceof Array&&function(t,e){t.__proto__=e}||function(t,e){for(var r in e)Object.prototype.hasOwnProperty.call(e,r)&&(t[r]=e[r])},t(e,r)};function e(e,r){if("function"!=typeof r&&null!==r)throw new TypeError("Class extends value "+String(r)+" is not a constructor or null");function n(){this.constructor=e}t(e,r),e.prototype=null===r?Object.create(r):(n.prototype=r.prototype,new n)}var r=function(){return r=Object.assign||function(t){for(var e,r=1,n=arguments.length;r<n;r++)for(var i in e=arguments[r])Object.prototype.hasOwnProperty.call(e,i)&&(t[i]=e[i]);return t},r.apply(this,arguments)};function n(t,e,r,n){return new(r||(r=Promise))((function(i,o){function s(t){try{c(n.next(t))}catch(t){o(t)}}function a(t){try{c(n.throw(t))}catch(t){o(t)}}function c(t){var e;t.done?i(t.value):(e=t.value,e instanceof r?e:new r((function(t){t(e)}))).then(s,a)}c((n=n.apply(t,e||[])).next())}))}function i(t,e){var r,n,i,o={label:0,sent:function(){if(1&i[0])throw i[1];return i[1]},trys:[],ops:[]},s=Object.create(("function"==typeof Iterator?Iterator:Object).prototype);return s.next=a(0),s.throw=a(1),s.return=a(2),"function"==typeof Symbol&&(s[Symbol.iterator]=function(){return this}),s;function a(a){return function(c){return function(a){if(r)throw new TypeError("Generator is already executing.");for(;s&&(s=0,a[0]&&(o=0)),o;)try{if(r=1,n&&(i=2&a[0]?n.return:a[0]?n.throw||((i=n.return)&&i.call(n),0):n.next)&&!(i=i.call(n,a[1])).done)return i;switch(n=0,i&&(a=[2&a[0],i.value]),a[0]){case 0:case 1:i=a;break;case 4:return o.label++,{value:a[1],done:!1};case 5:o.label++,n=a[1],a=[0];continue;case 7:a=o.ops.pop(),o.trys.pop();continue;default:if(!(i=o.trys,(i=i.length>0&&i[i.length-1])||6!==a[0]&&2!==a[0])){o=0;continue}if(3===a[0]&&(!i||a[1]>i[0]&&a[1]<i[3])){o.label=a[1];break}if(6===a[0]&&o.label<i[1]){o.label=i[1],i=a;break}if(i&&o.label<i[2]){o.label=i[2],o.ops.push(a);break}i[2]&&o.ops.pop(),o.trys.pop();continue}a=e.call(t,o)}catch(t){a=[6,t],n=0}finally{r=i=0}if(5&a[0])throw a[1];return{value:a[0]?a[1]:void 0,done:!0}}([a,c])}}}function o(t,e,r){if(r||2===arguments.length)for(var n,i=0,o=e.length;i<o;i++)!n&&i in e||(n||(n=Array.prototype.slice.call(e,0,i)),n[i]=e[i]);return t.concat(n||Array.prototype.slice.call(e))}"function"==typeof SuppressedError&&SuppressedError;var s,a={exports:{}};var c=function(){if(s)return a.exports;function t(){}return s=1,t.prototype={on:function(t,e,r){var n=this.e||(this.e={});return(n[t]||(n[t]=[])).push({fn:e,ctx:r}),this},once:function(t,e,r){var n=this;function i(){n.off(t,i),e.apply(r,arguments)}return i._=e,this.on(t,i,r)},emit:function(t){for(var e=[].slice.call(arguments,1),r=((this.e||(this.e={}))[t]||[]).slice(),n=0,i=r.length;n<i;n++)r[n].fn.apply(r[n].ctx,e);return this},off:function(t,e){var r=this.e||(this.e={}),n=r[t],i=[];if(n&&e)for(var o=0,s=n.length;o<s;o++)n[o].fn!==e&&n[o].fn._!==e&&i.push(n[o]);return i.length?r[t]=i:delete r[t],this}},a.exports=t,a.exports.TinyEmitter=t,a.exports}(),u=function(t){var e=t[1];return null!=e},l=function(t){var e=t.properties,r=void 0===e?{}:e,n=function(t,e){var r={};for(var n in t)Object.prototype.hasOwnProperty.call(t,n)&&e.indexOf(n)<0&&(r[n]=t[n]);if(null!=t&&"function"==typeof Object.getOwnPropertySymbols){var i=0;for(n=Object.getOwnPropertySymbols(t);i<n.length;i++)e.indexOf(n[i])<0&&Object.prototype.propertyIsEnumerable.call(t,n[i])&&(r[n[i]]=t[n[i]])}return r}(t,["properties"]),i=function(t){return Object.entries(t).sort((function(t,e){var r=t[0],n=e[0];return r.localeCompare(n,void 0)}))};return JSON.stringify([i(n),i(r)])},h=function(t){return n(void 0,void 0,void 0,(function(){var e;return i(this,(function(r){switch(r.label){case 0:e=l(t),r.label=1;case 1:return r.trys.push([1,3,,4]),[4,(o=e,n(void 0,void 0,void 0,(function(){var t,e,r,n,s;return i(this,(function(i){switch(i.label){case 0:if(t="undefined"!=typeof globalThis&&(null===(n=globalThis.crypto)||void 0===n?void 0:n.subtle)?null===(s=globalThis.crypto)||void 0===s?void 0:s.subtle:void 0,"undefined"==typeof TextEncoder||!(null==t?void 0:t.digest)||"undefined"==typeof Uint8Array)throw new Error("Hashing function not available");return e=(new TextEncoder).encode(o),[4,t.digest("SHA-256",e)];case 1:return r=i.sent(),[2,Array.from(new Uint8Array(r)).map((function(t){return t.toString(16).padStart(2,"0")})).join("")]}}))})))];case 2:return[2,r.sent()];case 3:return r.sent(),[2,e];case 4:return[2]}var o}))}))},p=function(t){var e,r=t.clientKey,n=t.appName,i=t.connectionId,o=t.customHeaders,s=t.headerName,a=void 0===s?"authorization":s,c=t.etag,l=t.isPost,h=((e={accept:"application/json"})[a.toLocaleLowerCase()]=r,e["unleash-sdk"]="unleash-js-sdk:3.8.2",e["unleash-appname"]=n,e);return l&&(h["content-type"]="application/json"),c&&(h["if-none-match"]=c),Object.entries(o||{}).filter(u).forEach((function(t){var e=t[0],r=t[1];return h[e.toLocaleLowerCase()]=r})),h["unleash-connection-id"]=i,h},f=function(){},d=function(){function t(t){var e=t.onError,r=t.onSent,n=t.appName,i=t.metricsInterval,o=t.disableMetrics,s=void 0!==o&&o,a=t.url,c=t.clientKey,u=t.fetch,l=t.headerName,h=t.customHeaders,p=void 0===h?{}:h,d=t.metricsIntervalInitial,m=t.connectionId,v=t.metricRegistry;this.onError=e,this.onSent=r||f,this.disabled=s,this.metricsInterval=1e3*i,this.metricsIntervalInitial=1e3*d,this.appName=n,this.url=a instanceof URL?a:new URL(a),this.clientKey=c,this.bucket=this.createEmptyBucket(),this.fetch=u,this.headerName=l,this.customHeaders=p,this.connectionId=m,this.metricRegistry=v}return t.prototype.start=function(){var t=this;if(this.disabled)return!1;this.setupMetricsFlushOnPageUnload(),"number"==typeof this.metricsInterval&&this.metricsInterval>0&&(this.metricsIntervalInitial>0?setTimeout((function(){t.startTimer(),t.sendMetrics()}),this.metricsIntervalInitial):this.startTimer())},t.prototype.stop=function(){this.timer&&(clearInterval(this.timer),delete this.timer),this.removeMetricsFlushOnPageUnload()},t.prototype.createEmptyBucket=function(){return{start:new Date,stop:null,toggles:{}}},t.prototype.getHeaders=function(){return p({clientKey:this.clientKey,appName:this.appName,connectionId:this.connectionId,customHeaders:this.customHeaders,headerName:this.headerName,isPost:!0})},t.prototype.sendMetrics=function(){return n(this,arguments,void 0,(function(t){var e,r,n,o=(void 0===t?{}:t).fireAndForget,s=void 0!==o&&o;return i(this,(function(t){switch(t.label){case 0:if(e="".concat(this.url.toString().replace(/\/$/,""),"/client/metrics"),r=this.getPayload(),this.bucketIsEmpty(r)&&(!r.impactMetrics||0===r.impactMetrics.length))return[2];t.label=1;case 1:return t.trys.push([1,3,,4]),[4,this.fetch(e,{cache:"no-cache",method:"POST",headers:this.getHeaders(),body:JSON.stringify(r),keepalive:s})];case 2:return t.sent(),this.onSent(r),[3,4];case 3:return n=t.sent(),console.error("Unleash: unable to send feature metrics",n),this.onError(n),[3,4];case 4:return[2]}}))}))},t.prototype.count=function(t,e){return!(this.disabled||!this.bucket)&&(this.assertBucket(t),this.bucket.toggles[t][e?"yes":"no"]++,!0)},t.prototype.countVariant=function(t,e){return!(this.disabled||!this.bucket)&&(this.assertBucket(t),this.bucket.toggles[t].variants[e]?this.bucket.toggles[t].variants[e]+=1:this.bucket.toggles[t].variants[e]=1,!0)},t.prototype.assertBucket=function(t){if(this.disabled||!this.bucket)return!1;this.bucket.toggles[t]||(this.bucket.toggles[t]={yes:0,no:0,variants:{}})},t.prototype.startTimer=function(){var t=this;this.timer=setInterval((function(){t.sendMetrics()}),this.metricsInterval)},t.prototype.bucketIsEmpty=function(t){return 0===Object.keys(t.bucket.toggles).length},t.prototype.getPayload=function(){var t,e=r(r({},this.bucket),{stop:new Date});this.bucket=this.createEmptyBucket();var n={bucket:e,appName:this.appName,instanceId:"browser"},i=(null===(t=this.metricRegistry)||void 0===t?void 0:t.collect())||[];return n.impactMetrics=i,n},t.prototype.setupMetricsFlushOnPageUnload=function(){var t=this;"undefined"==typeof document||"undefined"==typeof window||"function"!=typeof document.addEventListener||document.addEventListener("visibilitychange",this.flushMetricsOnPageUnload=function(){"hidden"===document.visibilityState&&t.sendMetrics({fireAndForget:!0})})},t.prototype.removeMetricsFlushOnPageUnload=function(){this.flushMetricsOnPageUnload&&(document.removeEventListener("visibilitychange",this.flushMetricsOnPageUnload),this.flushMetricsOnPageUnload=void 0)},t}(),m=function(){function t(){this.store=new Map}return t.prototype.save=function(t,e){return n(this,void 0,void 0,(function(){return i(this,(function(r){return this.store.set(t,e),[2]}))}))},t.prototype.get=function(t){return n(this,void 0,void 0,(function(){return i(this,(function(e){return[2,this.store.get(t)]}))}))},t}(),v=function(){function t(t){void 0===t&&(t="unleash:repository"),this.prefix=t}return t.prototype.save=function(t,e){return n(this,void 0,void 0,(function(){var r,n;return i(this,(function(i){r=JSON.stringify(e),n="".concat(this.prefix,":").concat(t);try{window.localStorage.setItem(n,r)}catch(t){console.error(t)}return[2]}))}))},t.prototype.get=function(t){try{var e="".concat(this.prefix,":").concat(t),r=window.localStorage.getItem(e);return r?JSON.parse(r):void 0}catch(t){console.error(t)}},t}(),g=function(){var t;return"undefined"!=typeof globalThis&&(null===(t=globalThis.crypto)||void 0===t?void 0:t.randomUUID)?globalThis.crypto.randomUUID():"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,(function(t){var e=16*Math.random()|0;return("x"===t?e:3&e|8).toString(16)}))},y=function(){function t(){}return t.prototype.generateEventId=function(){return g()},t.prototype.createImpressionEvent=function(t,e,n,i,o,s){var a=this.createBaseEvent(t,e,n,i,o);return s?r(r({},a),{variant:s}):a},t.prototype.createBaseEvent=function(t,e,r,n,i){return{eventType:n,eventId:this.generateEventId(),context:t,enabled:e,featureName:r,impressionData:i}},t}();function b(t){return void 0!==t&&!Number.isFinite(t)}function w(t){return t?Object.keys(t).sort().map((function(e){return"".concat(e,"=").concat(t[e])})).join(","):""}function x(t){var e={};if(!t)return e;for(var r=0,n=t.split(",");r<n.length;r++){var i=n[r].split("="),o=i[0],s=i[1];e[o]=s}return e}var T=function(t){return"value"in t},E=function(t){return"buckets"in t},I=function(){function t(t){this.opts=t,this.values=new Map}return t.prototype.inc=function(t,e){var r;if(!b(t)){var n=null!=t?t:1;if(!(n<=0)){var i=w(e),o=null!==(r=this.values.get(i))&&void 0!==r?r:0;this.values.set(i,o+n)}}},t.prototype.collect=function(){var t=Array.from(this.values.entries()).map((function(t){var e=t[0],r=t[1];return{labels:x(e),value:r}}));return this.values.clear(),0===t.length&&t.push({labels:{},value:0}),{name:this.opts.name,help:this.opts.help,type:"counter",samples:t}},t}(),R=function(){function t(t){this.opts=t,this.values=new Map;var e=t.buckets&&t.buckets.length>0?t.buckets:[.005,.01,.025,.05,.1,.25,.5,1,2.5,5,10],r=Array.from(new Set(e.filter((function(t){return t!==1/0})))).sort((function(t,e){return t-e}));this.buckets=o(o([],r,!0),[1/0],!1)}return t.prototype.restore=function(t){var e=w(t.labels),r={count:t.count,sum:t.sum,buckets:new Map(t.buckets.map((function(t){return["+Inf"===t.le?1/0:t.le,t.count]})))};this.values.set(e,r)},t.prototype.observe=function(t,e){var r;if(!b(t)){var n=w(e),i=this.values.get(n);if(!i){for(var o=new Map,s=0,a=this.buckets;s<a.length;s++){var c=a[s];o.set(c,0)}i={count:0,sum:0,buckets:o},this.values.set(n,i)}i.count++,i.sum+=t;for(var u=0,l=this.buckets;u<l.length;u++){if(t<=(c=l[u])){var h=null!==(r=i.buckets.get(c))&&void 0!==r?r:0;i.buckets.set(c,h+1)}}}},t.prototype.collect=function(){var t=Array.from(this.values.entries()).map((function(t){var e=t[0],r=t[1];return{labels:x(e),count:r.count,sum:r.sum,buckets:Array.from(r.buckets.entries()).map((function(t){var e=t[0];return{le:e===1/0?"+Inf":e,count:t[1]}}))}}));return this.values.clear(),0===t.length&&t.push({labels:{},count:0,sum:0,buckets:this.buckets.map((function(t){return{le:t===1/0?"+Inf":t,count:0}}))}),{name:this.opts.name,help:this.opts.help,type:"histogram",samples:t}},t}(),S=function(){function t(){this.counters=new Map,this.histograms=new Map}return t.prototype.getCounter=function(t){return this.counters.get(t)},t.prototype.getHistogram=function(t){return this.histograms.get(t)},t.prototype.counter=function(t){var e=t.name,r=this.counters.get(e);return r||(r=new I(t),this.counters.set(e,r)),r},t.prototype.histogram=function(t){var e=t.name,r=this.histograms.get(e);return r||(r=new R(t),this.histograms.set(e,r)),r},t.prototype.collect=function(){var t=Array.from(this.counters.values()).map((function(t){return t.collect()})),e=Array.from(this.histograms.values()).map((function(t){return t.collect()})),r=o(o([],t,!0),e,!0).filter((function(t){return t.samples.length>0}));return r.length>0?r:[]},t.prototype.restore=function(t){for(var e=function(t){switch(t.type){case"counter":for(var e=r.counter({name:t.name,help:t.help}),n=0,i=t.samples;n<i.length;n++){var o=i[n];T(o)&&e.inc(o.value,o.labels)}break;case"histogram":var s=t.samples.find(E);if(s){var a=s.buckets.map((function(t){return"+Inf"===t.le?1/0:t.le})),c=r.histogram({name:t.name,help:t.help,buckets:a});t.samples.filter(E).forEach((function(t){c.restore(t)}))}}},r=this,n=0,i=t;n<i.length;n++){e(i[n])}},t}(),k={INIT:"initialized",ERROR:"error",READY:"ready",UPDATE:"update",IMPRESSION:"impression",SENT:"sent",RECOVERED:"recovered",WARN:"warn"},O=function(t){function r(e,r,n){var i=t.call(this)||this;return i.metricRegistry=e,i.appName=r,i.environment=n,i}return e(r,t),r.prototype.defineCounter=function(t,e){if(t&&e){this.metricRegistry.counter({name:t,help:e,labelNames:["featureName","appName","environment"]})}else this.emit(k.WARN,"Counter name or help cannot be empty: ".concat(t,", ").concat(e,"."))},r.prototype.defineHistogram=function(t,e,r){if(t&&e){this.metricRegistry.histogram({name:t,help:e,labelNames:["featureName","appName","environment"],buckets:r})}else this.emit(k.WARN,"Histogram name or help cannot be empty: ".concat(t,", ").concat(e,"."))},r.prototype.incrementCounter=function(t,e){var r=this.metricRegistry.getCounter(t);if(r){var n={appName:this.appName,environment:this.environment};r.inc(e,n)}else this.emit(k.WARN,"Counter ".concat(t," not defined, this counter will not be incremented."))},r.prototype.observeHistogram=function(t,e){var r=this.metricRegistry.getHistogram(t);if(r){var n={appName:this.appName,environment:this.environment};r.observe(e,n)}else this.emit(k.WARN,"Histogram ".concat(t," not defined, this histogram will not be updated."))},r}(c.TinyEmitter),N=["userId","sessionId","remoteAddress","currentTime"],A=function(t){return N.includes(t)},P="isEnabled",U="getVariant",M={name:"disabled",enabled:!1,feature_enabled:!1},C="repo",L="repoLastUpdateTimestamp",D=function(){try{if("undefined"!=typeof window&&"fetch"in window)return fetch.bind(window);if("fetch"in globalThis)return fetch.bind(globalThis)}catch(t){console.error('Unleash failed to resolve "fetch"',t)}},H=function(t){function s(e){var n,i=e.storageProvider,o=e.url,s=e.clientKey,a=e.disableRefresh,c=void 0!==a&&a,u=e.refreshInterval,l=void 0===u?30:u,h=e.metricsInterval,p=void 0===h?30:h,f=e.metricsIntervalInitial,b=void 0===f?2:f,w=e.disableMetrics,x=void 0!==w&&w,T=e.appName,E=e.environment,I=void 0===E?"default":E,R=e.context,N=e.fetch,A=void 0===N?D():N,P=e.createAbortController,U=void 0===P?function(){try{if("undefined"!=typeof window&&"AbortController"in window)return function(){return new window.AbortController};if("fetch"in globalThis)return function(){return new globalThis.AbortController}}catch(t){console.error('Unleash failed to resolve "AbortController" factory',t)}}():P,M=e.bootstrap,C=e.bootstrapOverride,L=void 0===C||C,H=e.headerName,j=void 0===H?"Authorization":H,F=e.customHeaders,K=void 0===F?{}:F,_=e.impressionDataAll,q=void 0!==_&&_,B=e.usePOSTrequests,V=void 0!==B&&B,W=e.experimental,Y=t.call(this)||this;if(Y.toggles=[],Y.etag="",Y.readyEventEmitted=!1,Y.fetchedFromServer=!1,Y.usePOSTrequests=!1,Y.started=!1,!o)throw new Error("url is required");if(!s)throw new Error("clientKey is required");if(!T)throw new Error("appName is required.");Y.eventsHandler=new y,Y.impressionDataAll=q,Y.toggles=M&&M.length>0?M:[],Y.url=o instanceof URL?o:new URL(o),Y.clientKey=s,Y.headerName=j,Y.customHeaders=K,Y.storage=i||("undefined"!=typeof window?new v:new m),Y.refreshInterval=c?0:1e3*l,Y.context=r({appName:T,environment:I},R),Y.usePOSTrequests=V,Y.sdkState="initializing";var J=null==W?void 0:W.metricsUrl;!J||J instanceof URL||(J=new URL(J)),Y.experimental=r(r({},W),{metricsUrl:J}),(null==W?void 0:W.togglesStorageTTL)&&(null==W?void 0:W.togglesStorageTTL)>0&&(Y.experimental.togglesStorageTTL=1e3*W.togglesStorageTTL),Y.lastRefreshTimestamp=0,Y.ready=new Promise((function(t){Y.init().then(t).catch((function(e){console.error(e),Y.sdkState="error",Y.emit(k.ERROR,e),Y.lastError=e,t()}))})),A||console.error('Unleash: You must either provide your own "fetch" implementation or run in an environment where "fetch" is available.'),U||console.error('Unleash: You must either provide your own "AbortController" implementation or run in an environment where "AbortController" is available.'),Y.fetch=A,Y.createAbortController=U,Y.bootstrap=M&&M.length>0?M:void 0,Y.bootstrapOverride=L,Y.connectionId=g(),Y.metricRegistry=new S;var z=Y.resolveEnvironment(s,I);return Y.impactMetrics=new O(Y.metricRegistry,T,z),Y.metrics=new d({onError:function(t){return Y.emit(k.ERROR,{type:"metrics",error:t})},onSent:Y.emit.bind(Y,k.SENT),appName:T,metricsInterval:p,disableMetrics:x,url:(null===(n=Y.experimental)||void 0===n?void 0:n.metricsUrl)||Y.url,clientKey:s,fetch:A,headerName:j,customHeaders:K,metricsIntervalInitial:b,connectionId:Y.connectionId,metricRegistry:Y.metricRegistry}),Y}return e(s,t),s.prototype.getAllToggles=function(){return o([],this.toggles,!0)},s.prototype.isEnabled=function(t){var e,r=this.toggles.find((function(e){return e.name===t})),n=!!r&&r.enabled;if(this.metrics.count(t,n),(null==r?void 0:r.impressionData)||this.impressionDataAll){var i=this.eventsHandler.createImpressionEvent(this.context,n,t,P,null!==(e=null==r?void 0:r.impressionData)&&void 0!==e?e:void 0);this.emit(k.IMPRESSION,i)}return n},s.prototype.getVariant=function(t){var e,n=this.toggles.find((function(e){return e.name===t})),i=(null==n?void 0:n.enabled)||!1,o=n?n.variant:M;if(o.name&&this.metrics.countVariant(t,o.name),this.metrics.count(t,i),(null==n?void 0:n.impressionData)||this.impressionDataAll){var s=this.eventsHandler.createImpressionEvent(this.context,i,t,U,null!==(e=null==n?void 0:n.impressionData)&&void 0!==e?e:void 0,o.name);this.emit(k.IMPRESSION,s)}return r(r({},o),{feature_enabled:i})},s.prototype.updateToggles=function(){return n(this,void 0,void 0,(function(){var t=this;return i(this,(function(e){switch(e.label){case 0:return this.timerRef||this.fetchedFromServer?[4,this.fetchToggles()]:[3,2];case 1:return e.sent(),[3,4];case 2:return this.started?[4,new Promise((function(e){var r=function(){t.fetchToggles().then((function(){t.off(k.READY,r),e()}))};t.once(k.READY,r)}))]:[3,4];case 3:e.sent(),e.label=4;case 4:return[2]}}))}))},s.prototype.updateContext=function(t){return n(this,void 0,void 0,(function(){var e;return i(this,(function(n){switch(n.label){case 0:return(t.appName||t.environment)&&this.emit(k.WARN,"appName and environment are static. They can't be updated with updateContext."),e={environment:this.context.environment,appName:this.context.appName,sessionId:this.context.sessionId},this.context=r(r({},e),t),[4,this.updateToggles()];case 1:return n.sent(),[2]}}))}))},s.prototype.getContext=function(){return r({},this.context)},s.prototype.setContextField=function(t,e){return n(this,void 0,void 0,(function(){var n,o,s;return i(this,(function(i){switch(i.label){case 0:return A(t)?this.context=r(r({},this.context),((o={})[t]=e,o)):(n=r(r({},this.context.properties),((s={})[t]=e,s)),this.context=r(r({},this.context),{properties:n})),[4,this.updateToggles()];case 1:return i.sent(),[2]}}))}))},s.prototype.removeContextField=function(t){return n(this,void 0,void 0,(function(){var e;return i(this,(function(n){switch(n.label){case 0:return A(t)?this.context=r(r({},this.context),((e={})[t]=void 0,e)):"object"==typeof this.context.properties&&delete this.context.properties[t],[4,this.updateToggles()];case 1:return n.sent(),[2]}}))}))},s.prototype.setReady=function(){this.readyEventEmitted=!0,this.emit(k.READY)},s.prototype.init=function(){return n(this,void 0,void 0,(function(){var t,e,n;return i(this,(function(i){switch(i.label){case 0:return[4,this.resolveSessionId()];case 1:return t=i.sent(),this.context=r({sessionId:t},this.context),[4,this.storage.get(C)];case 2:return e=i.sent()||[],n=this,[4,this.getLastRefreshTimestamp()];case 3:return n.lastRefreshTimestamp=i.sent(),!this.bootstrap||!this.bootstrapOverride&&0!==e.length?[3,6]:[4,this.storage.save(C,this.bootstrap)];case 4:return i.sent(),this.toggles=this.bootstrap,this.sdkState="healthy",[4,this.storeLastRefreshTimestamp()];case 5:return i.sent(),this.setReady(),[3,7];case 6:this.toggles=e,i.label=7;case 7:return this.sdkState="healthy",this.emit(k.INIT),[2]}}))}))},s.prototype.start=function(){return n(this,void 0,void 0,(function(){var t,e=this;return i(this,(function(r){switch(r.label){case 0:return this.started=!0,this.timerRef?(console.error("Unleash SDK has already started, if you want to restart the SDK you should call client.stop() before starting again."),[2]):[4,this.ready];case 1:return r.sent(),this.metrics.start(),t=this.refreshInterval,[4,this.initialFetchToggles()];case 2:return r.sent(),t>0&&(this.timerRef=setInterval((function(){return e.fetchToggles()}),t)),[2]}}))}))},s.prototype.stop=function(){this.timerRef&&(clearInterval(this.timerRef),this.timerRef=void 0),this.metrics.stop()},s.prototype.isReady=function(){return this.readyEventEmitted},s.prototype.getError=function(){return"error"===this.sdkState?this.lastError:void 0},s.prototype.sendMetrics=function(){return this.metrics.sendMetrics()},s.prototype.resolveSessionId=function(){return n(this,void 0,void 0,(function(){var t;return i(this,(function(e){switch(e.label){case 0:return this.context.sessionId?[2,this.context.sessionId]:[4,this.storage.get("sessionId")];case 1:return(t=e.sent())?[3,3]:(t=Math.floor(1e9*Math.random()),[4,this.storage.save("sessionId",t.toString(10))]);case 2:e.sent(),e.label=3;case 3:return[2,t.toString(10)]}}))}))},s.prototype.getHeaders=function(){return p({clientKey:this.clientKey,connectionId:this.connectionId,appName:this.context.appName,customHeaders:this.customHeaders,headerName:this.headerName,etag:this.etag,isPost:this.usePOSTrequests})},s.prototype.storeToggles=function(t){return n(this,void 0,void 0,(function(){return i(this,(function(e){switch(e.label){case 0:return this.toggles=t,this.emit(k.UPDATE),[4,this.storage.save(C,t)];case 1:return e.sent(),[2]}}))}))},s.prototype.isTogglesStorageTTLEnabled=function(){var t;return!!((null===(t=this.experimental)||void 0===t?void 0:t.togglesStorageTTL)&&this.experimental.togglesStorageTTL>0)},s.prototype.isUpToDate=function(){var t;if(!this.isTogglesStorageTTLEnabled())return!1;var e=Date.now(),r=(null===(t=this.experimental)||void 0===t?void 0:t.togglesStorageTTL)||0;return this.lastRefreshTimestamp>0&&this.lastRefreshTimestamp<=e&&e-this.lastRefreshTimestamp<=r},s.prototype.getLastRefreshTimestamp=function(){return n(this,void 0,void 0,(function(){var t,e;return i(this,(function(r){switch(r.label){case 0:return this.isTogglesStorageTTLEnabled()?[4,this.storage.get(L)]:[3,3];case 1:return t=r.sent(),[4,h(this.context)];case 2:return e=r.sent(),[2,(null==t?void 0:t.key)===e?t.timestamp:0];case 3:return[2,0]}}))}))},s.prototype.storeLastRefreshTimestamp=function(){return n(this,void 0,void 0,(function(){var t,e;return i(this,(function(r){switch(r.label){case 0:return this.isTogglesStorageTTLEnabled()?(this.lastRefreshTimestamp=Date.now(),e={},[4,h(this.context)]):[3,3];case 1:return e.key=r.sent(),e.timestamp=this.lastRefreshTimestamp,t=e,[4,this.storage.save(L,t)];case 2:r.sent(),r.label=3;case 3:return[2]}}))}))},s.prototype.initialFetchToggles=function(){if(!this.isUpToDate())return this.fetchToggles();this.fetchedFromServer||(this.fetchedFromServer=!0,this.setReady())},s.prototype.fetchToggles=function(){return n(this,void 0,void 0,(function(){var t,e,r,n,o,s,a,c,l;return i(this,(function(i){switch(i.label){case 0:if(!this.fetch)return[3,9];this.abortController&&!this.abortController.signal.aborted&&this.abortController.abort(),this.abortController=null===(l=this.createAbortController)||void 0===l?void 0:l.call(this),t=this.abortController?this.abortController.signal:void 0,i.label=1;case 1:return i.trys.push([1,7,8,9]),e=this.usePOSTrequests,r=e?this.url:function(t,e){var r=new URL(t.toString());return Object.entries(e).filter(u).forEach((function(t){var e=t[0],n=t[1];"properties"===e&&n?Object.entries(n).filter(u).forEach((function(t){var e=t[0],n=t[1];return r.searchParams.append("properties[".concat(e,"]"),n)})):r.searchParams.append(e,n)})),r}(this.url,this.context),n=e?"POST":"GET",o=e?JSON.stringify({context:this.context}):void 0,[4,this.fetch(r.toString(),{method:n,cache:"no-cache",headers:this.getHeaders(),body:o,signal:t})];case 2:return s=i.sent(),"error"===this.sdkState&&s.status<400&&(this.sdkState="healthy",this.emit(k.RECOVERED)),s.ok?(this.etag=s.headers.get("ETag")||"",[4,s.json()]):[3,5];case 3:return a=i.sent(),[4,this.storeToggles(a.toggles)];case 4:return i.sent(),"healthy"!==this.sdkState&&(this.sdkState="healthy"),this.fetchedFromServer||(this.fetchedFromServer=!0,this.setReady()),this.storeLastRefreshTimestamp(),[3,6];case 5:304===s.status?this.storeLastRefreshTimestamp():(console.error("Unleash: Fetching feature toggles did not have an ok response"),this.sdkState="error",this.emit(k.ERROR,{type:"HttpError",code:s.status}),this.lastError={type:"HttpError",code:s.status}),i.label=6;case 6:return[3,9];case 7:return"object"==typeof(c=i.sent())&&null!==c&&"name"in c&&"AbortError"===c.name||(console.error("Unleash: unable to fetch feature toggles",c),this.sdkState="error",this.emit(k.ERROR,{type:"fetch-toggles",error:c}),this.lastError=c),[3,9];case 8:return this.abortController=null,[7];case 9:return[2]}}))}))},s.prototype.resolveEnvironment=function(t,e){return function(t){var e=t.indexOf(":");if(-1!==e){var r=t.slice(e+1),n=r.lastIndexOf(".");if(-1!==n)return r.slice(0,n)}}(t)||e},s}(c.TinyEmitter);
+var t=function(e,r){return t=Object.setPrototypeOf||{__proto__:[]}instanceof Array&&function(t,e){t.__proto__=e}||function(t,e){for(var r in e)Object.prototype.hasOwnProperty.call(e,r)&&(t[r]=e[r])},t(e,r)};function e(e,r){if("function"!=typeof r&&null!==r)throw new TypeError("Class extends value "+String(r)+" is not a constructor or null");function n(){this.constructor=e}t(e,r),e.prototype=null===r?Object.create(r):(n.prototype=r.prototype,new n)}var r=function(){return r=Object.assign||function(t){for(var e,r=1,n=arguments.length;r<n;r++)for(var i in e=arguments[r])Object.prototype.hasOwnProperty.call(e,i)&&(t[i]=e[i]);return t},r.apply(this,arguments)};function n(t,e,r,n){return new(r||(r=Promise))((function(i,o){function s(t){try{c(n.next(t))}catch(t){o(t)}}function a(t){try{c(n.throw(t))}catch(t){o(t)}}function c(t){var e;t.done?i(t.value):(e=t.value,e instanceof r?e:new r((function(t){t(e)}))).then(s,a)}c((n=n.apply(t,e||[])).next())}))}function i(t,e){var r,n,i,o={label:0,sent:function(){if(1&i[0])throw i[1];return i[1]},trys:[],ops:[]},s=Object.create(("function"==typeof Iterator?Iterator:Object).prototype);return s.next=a(0),s.throw=a(1),s.return=a(2),"function"==typeof Symbol&&(s[Symbol.iterator]=function(){return this}),s;function a(a){return function(c){return function(a){if(r)throw new TypeError("Generator is already executing.");for(;s&&(s=0,a[0]&&(o=0)),o;)try{if(r=1,n&&(i=2&a[0]?n.return:a[0]?n.throw||((i=n.return)&&i.call(n),0):n.next)&&!(i=i.call(n,a[1])).done)return i;switch(n=0,i&&(a=[2&a[0],i.value]),a[0]){case 0:case 1:i=a;break;case 4:return o.label++,{value:a[1],done:!1};case 5:o.label++,n=a[1],a=[0];continue;case 7:a=o.ops.pop(),o.trys.pop();continue;default:if(!(i=o.trys,(i=i.length>0&&i[i.length-1])||6!==a[0]&&2!==a[0])){o=0;continue}if(3===a[0]&&(!i||a[1]>i[0]&&a[1]<i[3])){o.label=a[1];break}if(6===a[0]&&o.label<i[1]){o.label=i[1],i=a;break}if(i&&o.label<i[2]){o.label=i[2],o.ops.push(a);break}i[2]&&o.ops.pop(),o.trys.pop();continue}a=e.call(t,o)}catch(t){a=[6,t],n=0}finally{r=i=0}if(5&a[0])throw a[1];return{value:a[0]?a[1]:void 0,done:!0}}([a,c])}}}function o(t,e,r){if(r||2===arguments.length)for(var n,i=0,o=e.length;i<o;i++)!n&&i in e||(n||(n=Array.prototype.slice.call(e,0,i)),n[i]=e[i]);return t.concat(n||Array.prototype.slice.call(e))}"function"==typeof SuppressedError&&SuppressedError;var s,a={exports:{}};var c=function(){if(s)return a.exports;function t(){}return s=1,t.prototype={on:function(t,e,r){var n=this.e||(this.e={});return(n[t]||(n[t]=[])).push({fn:e,ctx:r}),this},once:function(t,e,r){var n=this;function i(){n.off(t,i),e.apply(r,arguments)}return i._=e,this.on(t,i,r)},emit:function(t){for(var e=[].slice.call(arguments,1),r=((this.e||(this.e={}))[t]||[]).slice(),n=0,i=r.length;n<i;n++)r[n].fn.apply(r[n].ctx,e);return this},off:function(t,e){var r=this.e||(this.e={}),n=r[t],i=[];if(n&&e)for(var o=0,s=n.length;o<s;o++)n[o].fn!==e&&n[o].fn._!==e&&i.push(n[o]);return i.length?r[t]=i:delete r[t],this}},a.exports=t,a.exports.TinyEmitter=t,a.exports}(),u=function(t){var e=t[1];return null!=e},l=function(t){var e=t.properties,r=void 0===e?{}:e,n=function(t,e){var r={};for(var n in t)Object.prototype.hasOwnProperty.call(t,n)&&e.indexOf(n)<0&&(r[n]=t[n]);if(null!=t&&"function"==typeof Object.getOwnPropertySymbols){var i=0;for(n=Object.getOwnPropertySymbols(t);i<n.length;i++)e.indexOf(n[i])<0&&Object.prototype.propertyIsEnumerable.call(t,n[i])&&(r[n[i]]=t[n[i]])}return r}(t,["properties"]),i=function(t){return Object.entries(t).sort((function(t,e){var r=t[0],n=e[0];return r.localeCompare(n,void 0)}))};return JSON.stringify([i(n),i(r)])},h=function(t){return n(void 0,void 0,void 0,(function(){var e;return i(this,(function(r){switch(r.label){case 0:e=l(t),r.label=1;case 1:return r.trys.push([1,3,,4]),[4,(o=e,n(void 0,void 0,void 0,(function(){var t,e,r,n,s;return i(this,(function(i){switch(i.label){case 0:if(t="undefined"!=typeof globalThis&&(null===(n=globalThis.crypto)||void 0===n?void 0:n.subtle)?null===(s=globalThis.crypto)||void 0===s?void 0:s.subtle:void 0,"undefined"==typeof TextEncoder||!(null==t?void 0:t.digest)||"undefined"==typeof Uint8Array)throw new Error("Hashing function not available");return e=(new TextEncoder).encode(o),[4,t.digest("SHA-256",e)];case 1:return r=i.sent(),[2,Array.from(new Uint8Array(r)).map((function(t){return t.toString(16).padStart(2,"0")})).join("")]}}))})))];case 2:return[2,r.sent()];case 3:return r.sent(),[2,e];case 4:return[2]}var o}))}))},p=function(t){var e,r=t.clientKey,n=t.appName,i=t.connectionId,o=t.customHeaders,s=t.headerName,a=void 0===s?"authorization":s,c=t.etag,l=t.isPost,h=((e={accept:"application/json"})[a.toLocaleLowerCase()]=r,e["unleash-sdk"]="unleash-js-sdk:3.8.3",e["unleash-appname"]=n,e);return l&&(h["content-type"]="application/json"),c&&(h["if-none-match"]=c),Object.entries(o||{}).filter(u).forEach((function(t){var e=t[0],r=t[1];return h[e.toLocaleLowerCase()]=r})),h["unleash-connection-id"]=i,h},f=function(){},d=function(){function t(t){var e=t.onError,r=t.onSent,n=t.appName,i=t.metricsInterval,o=t.disableMetrics,s=void 0!==o&&o,a=t.url,c=t.clientKey,u=t.fetch,l=t.headerName,h=t.customHeaders,p=void 0===h?{}:h,d=t.metricsIntervalInitial,m=t.connectionId,v=t.metricRegistry;this.onError=e,this.onSent=r||f,this.disabled=s,this.metricsInterval=1e3*i,this.metricsIntervalInitial=1e3*d,this.appName=n,this.url=a instanceof URL?a:new URL(a),this.clientKey=c,this.bucket=this.createEmptyBucket(),this.fetch=u,this.headerName=l,this.customHeaders=p,this.connectionId=m,this.metricRegistry=v}return t.prototype.start=function(){var t=this;if(this.disabled||this.timer||this.flushMetricsOnPageUnload)return!1;this.setupMetricsFlushOnPageUnload(),"number"==typeof this.metricsInterval&&this.metricsInterval>0&&(this.metricsIntervalInitial>0?this.timer=setTimeout((function(){t.startTimer(),t.sendMetrics()}),this.metricsIntervalInitial):this.startTimer())},t.prototype.stop=function(){this.timer&&(clearInterval(this.timer),delete this.timer),this.removeMetricsFlushOnPageUnload()},t.prototype.createEmptyBucket=function(){return{start:new Date,stop:null,toggles:{}}},t.prototype.getHeaders=function(){return p({clientKey:this.clientKey,appName:this.appName,connectionId:this.connectionId,customHeaders:this.customHeaders,headerName:this.headerName,isPost:!0})},t.prototype.sendMetrics=function(){return n(this,arguments,void 0,(function(t){var e,r,n,o=(void 0===t?{}:t).fireAndForget,s=void 0!==o&&o;return i(this,(function(t){switch(t.label){case 0:if(e="".concat(this.url.toString().replace(/\/$/,""),"/client/metrics"),r=this.getPayload(),this.bucketIsEmpty(r)&&(!r.impactMetrics||0===r.impactMetrics.length))return[2];t.label=1;case 1:return t.trys.push([1,3,,4]),[4,this.fetch(e,{cache:"no-cache",method:"POST",headers:this.getHeaders(),body:JSON.stringify(r),keepalive:s})];case 2:return t.sent(),this.onSent(r),[3,4];case 3:return n=t.sent(),console.error("Unleash: unable to send feature metrics",n),this.onError(n),[3,4];case 4:return[2]}}))}))},t.prototype.count=function(t,e){return!(this.disabled||!this.bucket)&&(this.assertBucket(t),this.bucket.toggles[t][e?"yes":"no"]++,!0)},t.prototype.countVariant=function(t,e){return!(this.disabled||!this.bucket)&&(this.assertBucket(t),this.bucket.toggles[t].variants[e]?this.bucket.toggles[t].variants[e]+=1:this.bucket.toggles[t].variants[e]=1,!0)},t.prototype.assertBucket=function(t){if(this.disabled||!this.bucket)return!1;this.bucket.toggles[t]||(this.bucket.toggles[t]={yes:0,no:0,variants:{}})},t.prototype.startTimer=function(){var t=this;this.timer=setInterval((function(){t.sendMetrics()}),this.metricsInterval)},t.prototype.bucketIsEmpty=function(t){return 0===Object.keys(t.bucket.toggles).length},t.prototype.getPayload=function(){var t,e=r(r({},this.bucket),{stop:new Date});this.bucket=this.createEmptyBucket();var n={bucket:e,appName:this.appName,instanceId:"browser"},i=(null===(t=this.metricRegistry)||void 0===t?void 0:t.collect())||[];return n.impactMetrics=i,n},t.prototype.setupMetricsFlushOnPageUnload=function(){var t=this;"undefined"==typeof document||"undefined"==typeof window||"function"!=typeof document.addEventListener||document.addEventListener("visibilitychange",this.flushMetricsOnPageUnload=function(){"hidden"===document.visibilityState&&t.sendMetrics({fireAndForget:!0})})},t.prototype.removeMetricsFlushOnPageUnload=function(){this.flushMetricsOnPageUnload&&(document.removeEventListener("visibilitychange",this.flushMetricsOnPageUnload),this.flushMetricsOnPageUnload=void 0)},t}(),m=function(){function t(){this.store=new Map}return t.prototype.save=function(t,e){return n(this,void 0,void 0,(function(){return i(this,(function(r){return this.store.set(t,e),[2]}))}))},t.prototype.get=function(t){return n(this,void 0,void 0,(function(){return i(this,(function(e){return[2,this.store.get(t)]}))}))},t}(),v=function(){function t(t){void 0===t&&(t="unleash:repository"),this.prefix=t}return t.prototype.save=function(t,e){return n(this,void 0,void 0,(function(){var r,n;return i(this,(function(i){r=JSON.stringify(e),n="".concat(this.prefix,":").concat(t);try{window.localStorage.setItem(n,r)}catch(t){console.error(t)}return[2]}))}))},t.prototype.get=function(t){try{var e="".concat(this.prefix,":").concat(t),r=window.localStorage.getItem(e);return r?JSON.parse(r):void 0}catch(t){console.error(t)}},t}(),g=function(){var t;return"undefined"!=typeof globalThis&&(null===(t=globalThis.crypto)||void 0===t?void 0:t.randomUUID)?globalThis.crypto.randomUUID():"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,(function(t){var e=16*Math.random()|0;return("x"===t?e:3&e|8).toString(16)}))},y=function(){function t(){}return t.prototype.generateEventId=function(){return g()},t.prototype.createImpressionEvent=function(t,e,n,i,o,s){var a=this.createBaseEvent(t,e,n,i,o);return s?r(r({},a),{variant:s}):a},t.prototype.createBaseEvent=function(t,e,r,n,i){return{eventType:n,eventId:this.generateEventId(),context:t,enabled:e,featureName:r,impressionData:i}},t}();function b(t){return void 0!==t&&!Number.isFinite(t)}function w(t){return t?Object.keys(t).sort().map((function(e){return"".concat(e,"=").concat(t[e])})).join(","):""}function x(t){var e={};if(!t)return e;for(var r=0,n=t.split(",");r<n.length;r++){var i=n[r].split("="),o=i[0],s=i[1];e[o]=s}return e}var T=function(t){return"value"in t},E=function(t){return"buckets"in t},I=function(){function t(t){this.opts=t,this.values=new Map}return t.prototype.inc=function(t,e){var r;if(!b(t)){var n=null!=t?t:1;if(!(n<=0)){var i=w(e),o=null!==(r=this.values.get(i))&&void 0!==r?r:0;this.values.set(i,o+n)}}},t.prototype.collect=function(){var t=Array.from(this.values.entries()).map((function(t){var e=t[0],r=t[1];return{labels:x(e),value:r}}));return this.values.clear(),0===t.length&&t.push({labels:{},value:0}),{name:this.opts.name,help:this.opts.help,type:"counter",samples:t}},t}(),R=function(){function t(t){this.opts=t,this.values=new Map;var e=t.buckets&&t.buckets.length>0?t.buckets:[.005,.01,.025,.05,.1,.25,.5,1,2.5,5,10],r=Array.from(new Set(e.filter((function(t){return t!==1/0})))).sort((function(t,e){return t-e}));this.buckets=o(o([],r,!0),[1/0],!1)}return t.prototype.restore=function(t){var e=w(t.labels),r={count:t.count,sum:t.sum,buckets:new Map(t.buckets.map((function(t){return["+Inf"===t.le?1/0:t.le,t.count]})))};this.values.set(e,r)},t.prototype.observe=function(t,e){var r;if(!b(t)){var n=w(e),i=this.values.get(n);if(!i){for(var o=new Map,s=0,a=this.buckets;s<a.length;s++){var c=a[s];o.set(c,0)}i={count:0,sum:0,buckets:o},this.values.set(n,i)}i.count++,i.sum+=t;for(var u=0,l=this.buckets;u<l.length;u++){if(t<=(c=l[u])){var h=null!==(r=i.buckets.get(c))&&void 0!==r?r:0;i.buckets.set(c,h+1)}}}},t.prototype.collect=function(){var t=Array.from(this.values.entries()).map((function(t){var e=t[0],r=t[1];return{labels:x(e),count:r.count,sum:r.sum,buckets:Array.from(r.buckets.entries()).map((function(t){var e=t[0];return{le:e===1/0?"+Inf":e,count:t[1]}}))}}));return this.values.clear(),0===t.length&&t.push({labels:{},count:0,sum:0,buckets:this.buckets.map((function(t){return{le:t===1/0?"+Inf":t,count:0}}))}),{name:this.opts.name,help:this.opts.help,type:"histogram",samples:t}},t}(),S=function(){function t(){this.counters=new Map,this.histograms=new Map}return t.prototype.getCounter=function(t){return this.counters.get(t)},t.prototype.getHistogram=function(t){return this.histograms.get(t)},t.prototype.counter=function(t){var e=t.name,r=this.counters.get(e);return r||(r=new I(t),this.counters.set(e,r)),r},t.prototype.histogram=function(t){var e=t.name,r=this.histograms.get(e);return r||(r=new R(t),this.histograms.set(e,r)),r},t.prototype.collect=function(){var t=Array.from(this.counters.values()).map((function(t){return t.collect()})),e=Array.from(this.histograms.values()).map((function(t){return t.collect()})),r=o(o([],t,!0),e,!0).filter((function(t){return t.samples.length>0}));return r.length>0?r:[]},t.prototype.restore=function(t){for(var e=function(t){switch(t.type){case"counter":for(var e=r.counter({name:t.name,help:t.help}),n=0,i=t.samples;n<i.length;n++){var o=i[n];T(o)&&e.inc(o.value,o.labels)}break;case"histogram":var s=t.samples.find(E);if(s){var a=s.buckets.map((function(t){return"+Inf"===t.le?1/0:t.le})),c=r.histogram({name:t.name,help:t.help,buckets:a});t.samples.filter(E).forEach((function(t){c.restore(t)}))}}},r=this,n=0,i=t;n<i.length;n++){e(i[n])}},t}(),k={INIT:"initialized",ERROR:"error",READY:"ready",UPDATE:"update",IMPRESSION:"impression",SENT:"sent",RECOVERED:"recovered",WARN:"warn"},O=function(t){function r(e,r,n){var i=t.call(this)||this;return i.metricRegistry=e,i.appName=r,i.environment=n,i}return e(r,t),r.prototype.defineCounter=function(t,e){if(t&&e){this.metricRegistry.counter({name:t,help:e,labelNames:["featureName","appName","environment"]})}else this.emit(k.WARN,"Counter name or help cannot be empty: ".concat(t,", ").concat(e,"."))},r.prototype.defineHistogram=function(t,e,r){if(t&&e){this.metricRegistry.histogram({name:t,help:e,labelNames:["featureName","appName","environment"],buckets:r})}else this.emit(k.WARN,"Histogram name or help cannot be empty: ".concat(t,", ").concat(e,"."))},r.prototype.incrementCounter=function(t,e){var r=this.metricRegistry.getCounter(t);if(r){var n={appName:this.appName,environment:this.environment};r.inc(e,n)}else this.emit(k.WARN,"Counter ".concat(t," not defined, this counter will not be incremented."))},r.prototype.observeHistogram=function(t,e){var r=this.metricRegistry.getHistogram(t);if(r){var n={appName:this.appName,environment:this.environment};r.observe(e,n)}else this.emit(k.WARN,"Histogram ".concat(t," not defined, this histogram will not be updated."))},r}(c.TinyEmitter),N=["userId","sessionId","remoteAddress","currentTime"],A=function(t){return N.includes(t)},P="isEnabled",U="getVariant",C={name:"disabled",enabled:!1,feature_enabled:!1},M="repo",L="repoLastUpdateTimestamp",D=function(){try{if("undefined"!=typeof window&&"fetch"in window)return fetch.bind(window);if("fetch"in globalThis)return fetch.bind(globalThis)}catch(t){console.error('Unleash failed to resolve "fetch"',t)}},H=function(t){function s(e){var n,i=e.storageProvider,o=e.url,s=e.clientKey,a=e.disableRefresh,c=void 0!==a&&a,u=e.refreshInterval,l=void 0===u?30:u,h=e.metricsInterval,p=void 0===h?30:h,f=e.metricsIntervalInitial,b=void 0===f?2:f,w=e.disableMetrics,x=void 0!==w&&w,T=e.appName,E=e.environment,I=void 0===E?"default":E,R=e.context,N=e.fetch,A=void 0===N?D():N,P=e.createAbortController,U=void 0===P?function(){try{if("undefined"!=typeof window&&"AbortController"in window)return function(){return new window.AbortController};if("fetch"in globalThis)return function(){return new globalThis.AbortController}}catch(t){console.error('Unleash failed to resolve "AbortController" factory',t)}}():P,C=e.bootstrap,M=e.bootstrapOverride,L=void 0===M||M,H=e.headerName,j=void 0===H?"Authorization":H,F=e.customHeaders,K=void 0===F?{}:F,_=e.impressionDataAll,q=void 0!==_&&_,B=e.usePOSTrequests,V=void 0!==B&&B,Y=e.experimental,J=t.call(this)||this;if(J.toggles=[],J.etag="",J.readyEventEmitted=!1,J.fetchedFromServer=!1,J.usePOSTrequests=!1,J.started=!1,J.stopCount=0,!o)throw new Error("url is required");if(!s)throw new Error("clientKey is required");if(!T)throw new Error("appName is required.");J.eventsHandler=new y,J.impressionDataAll=q,J.toggles=C&&C.length>0?C:[],J.url=o instanceof URL?o:new URL(o),J.clientKey=s,J.headerName=j,J.customHeaders=K,J.storage=i||("undefined"!=typeof window?new v:new m),J.refreshInterval=c?0:1e3*l,J.context=r({appName:T,environment:I},R),J.usePOSTrequests=V,J.sdkState="initializing";var W=null==Y?void 0:Y.metricsUrl;!W||W instanceof URL||(W=new URL(W)),J.experimental=r(r({},Y),{metricsUrl:W}),(null==Y?void 0:Y.togglesStorageTTL)&&(null==Y?void 0:Y.togglesStorageTTL)>0&&(J.experimental.togglesStorageTTL=1e3*Y.togglesStorageTTL),J.lastRefreshTimestamp=0,J.ready=new Promise((function(t){J.init().then(t).catch((function(e){console.error(e),J.sdkState="error",J.emit(k.ERROR,e),J.lastError=e,t()}))})),A||console.error('Unleash: You must either provide your own "fetch" implementation or run in an environment where "fetch" is available.'),U||console.error('Unleash: You must either provide your own "AbortController" implementation or run in an environment where "AbortController" is available.'),J.fetch=A,J.createAbortController=U,J.bootstrap=C&&C.length>0?C:void 0,J.bootstrapOverride=L,J.connectionId=g(),J.metricRegistry=new S;var z=J.resolveEnvironment(s,I);return J.impactMetrics=new O(J.metricRegistry,T,z),J.metrics=new d({onError:function(t){return J.emit(k.ERROR,{type:"metrics",error:t})},onSent:J.emit.bind(J,k.SENT),appName:T,metricsInterval:p,disableMetrics:x,url:(null===(n=J.experimental)||void 0===n?void 0:n.metricsUrl)||J.url,clientKey:s,fetch:A,headerName:j,customHeaders:K,metricsIntervalInitial:b,connectionId:J.connectionId,metricRegistry:J.metricRegistry}),J}return e(s,t),s.prototype.getAllToggles=function(){return o([],this.toggles,!0)},s.prototype.isEnabled=function(t){var e,r=this.toggles.find((function(e){return e.name===t})),n=!!r&&r.enabled;if(this.metrics.count(t,n),(null==r?void 0:r.impressionData)||this.impressionDataAll){var i=this.eventsHandler.createImpressionEvent(this.context,n,t,P,null!==(e=null==r?void 0:r.impressionData)&&void 0!==e?e:void 0);this.emit(k.IMPRESSION,i)}return n},s.prototype.getVariant=function(t){var e,n=this.toggles.find((function(e){return e.name===t})),i=(null==n?void 0:n.enabled)||!1,o=n?n.variant:C;if(o.name&&this.metrics.countVariant(t,o.name),this.metrics.count(t,i),(null==n?void 0:n.impressionData)||this.impressionDataAll){var s=this.eventsHandler.createImpressionEvent(this.context,i,t,U,null!==(e=null==n?void 0:n.impressionData)&&void 0!==e?e:void 0,o.name);this.emit(k.IMPRESSION,s)}return r(r({},o),{feature_enabled:i})},s.prototype.updateToggles=function(){return n(this,void 0,void 0,(function(){var t=this;return i(this,(function(e){switch(e.label){case 0:return this.timerRef||this.fetchedFromServer?[4,this.fetchToggles()]:[3,2];case 1:return e.sent(),[3,4];case 2:return this.started?[4,new Promise((function(e){var r=function(){t.fetchToggles().then((function(){t.off(k.READY,r),e()}))};t.once(k.READY,r)}))]:[3,4];case 3:e.sent(),e.label=4;case 4:return[2]}}))}))},s.prototype.updateContext=function(t){return n(this,void 0,void 0,(function(){var e;return i(this,(function(n){switch(n.label){case 0:return e={environment:this.context.environment,appName:this.context.appName,sessionId:this.context.sessionId},this.context=r(r({},e),t),[4,this.updateToggles()];case 1:return n.sent(),[2]}}))}))},s.prototype.getContext=function(){return r({},this.context)},s.prototype.setContextField=function(t,e){return n(this,void 0,void 0,(function(){var n,o,s;return i(this,(function(i){switch(i.label){case 0:return A(t)?this.context=r(r({},this.context),((o={})[t]=e,o)):(n=r(r({},this.context.properties),((s={})[t]=e,s)),this.context=r(r({},this.context),{properties:n})),[4,this.updateToggles()];case 1:return i.sent(),[2]}}))}))},s.prototype.removeContextField=function(t){return n(this,void 0,void 0,(function(){var e;return i(this,(function(n){switch(n.label){case 0:return A(t)?this.context=r(r({},this.context),((e={})[t]=void 0,e)):"object"==typeof this.context.properties&&delete this.context.properties[t],[4,this.updateToggles()];case 1:return n.sent(),[2]}}))}))},s.prototype.setReady=function(){this.readyEventEmitted=!0,this.emit(k.READY)},s.prototype.init=function(){return n(this,void 0,void 0,(function(){var t,e,n;return i(this,(function(i){switch(i.label){case 0:return[4,this.resolveSessionId()];case 1:return t=i.sent(),this.context=r({sessionId:t},this.context),[4,this.storage.get(M)];case 2:return e=i.sent()||[],n=this,[4,this.getLastRefreshTimestamp()];case 3:return n.lastRefreshTimestamp=i.sent(),!this.bootstrap||!this.bootstrapOverride&&0!==e.length?[3,6]:[4,this.storage.save(M,this.bootstrap)];case 4:return i.sent(),this.toggles=this.bootstrap,this.sdkState="healthy",[4,this.storeLastRefreshTimestamp()];case 5:return i.sent(),this.setReady(),[3,7];case 6:this.toggles=e,i.label=7;case 7:return this.sdkState="healthy",this.emit(k.INIT),[2]}}))}))},s.prototype.start=function(){return n(this,void 0,void 0,(function(){var t,e,r=this;return i(this,(function(n){switch(n.label){case 0:return this.started=!0,t=this.stopCount,this.timerRef?(console.error("Unleash SDK has already started, if you want to restart the SDK you should call client.stop() before starting again."),[2]):[4,this.ready];case 1:return n.sent(),this.stopCount===t&&this.metrics.start(),e=this.refreshInterval,[4,this.initialFetchToggles()];case 2:return n.sent(),this.stopCount===t&&e>0&&!this.timerRef&&(this.timerRef=setInterval((function(){return r.fetchToggles()}),e)),[2]}}))}))},s.prototype.stop=function(){this.stopCount++,this.timerRef&&(clearInterval(this.timerRef),this.timerRef=void 0),this.metrics.stop()},s.prototype.isReady=function(){return this.readyEventEmitted},s.prototype.getError=function(){return"error"===this.sdkState?this.lastError:void 0},s.prototype.sendMetrics=function(){return this.metrics.sendMetrics()},s.prototype.resolveSessionId=function(){return n(this,void 0,void 0,(function(){var t;return i(this,(function(e){switch(e.label){case 0:return this.context.sessionId?[2,this.context.sessionId]:[4,this.storage.get("sessionId")];case 1:return(t=e.sent())?[3,3]:(t=Math.floor(1e9*Math.random()),[4,this.storage.save("sessionId",t.toString(10))]);case 2:e.sent(),e.label=3;case 3:return[2,t.toString(10)]}}))}))},s.prototype.getHeaders=function(){return p({clientKey:this.clientKey,connectionId:this.connectionId,appName:this.context.appName,customHeaders:this.customHeaders,headerName:this.headerName,etag:this.etag,isPost:this.usePOSTrequests})},s.prototype.storeToggles=function(t){return n(this,void 0,void 0,(function(){return i(this,(function(e){switch(e.label){case 0:return this.toggles=t,this.emit(k.UPDATE),[4,this.storage.save(M,t)];case 1:return e.sent(),[2]}}))}))},s.prototype.isTogglesStorageTTLEnabled=function(){var t;return!!((null===(t=this.experimental)||void 0===t?void 0:t.togglesStorageTTL)&&this.experimental.togglesStorageTTL>0)},s.prototype.isUpToDate=function(){var t;if(!this.isTogglesStorageTTLEnabled())return!1;var e=Date.now(),r=(null===(t=this.experimental)||void 0===t?void 0:t.togglesStorageTTL)||0;return this.lastRefreshTimestamp>0&&this.lastRefreshTimestamp<=e&&e-this.lastRefreshTimestamp<=r},s.prototype.getLastRefreshTimestamp=function(){return n(this,void 0,void 0,(function(){var t,e;return i(this,(function(r){switch(r.label){case 0:return this.isTogglesStorageTTLEnabled()?[4,this.storage.get(L)]:[3,3];case 1:return t=r.sent(),[4,h(this.context)];case 2:return e=r.sent(),[2,(null==t?void 0:t.key)===e?t.timestamp:0];case 3:return[2,0]}}))}))},s.prototype.storeLastRefreshTimestamp=function(){return n(this,void 0,void 0,(function(){var t,e;return i(this,(function(r){switch(r.label){case 0:return this.isTogglesStorageTTLEnabled()?(this.lastRefreshTimestamp=Date.now(),e={},[4,h(this.context)]):[3,3];case 1:return e.key=r.sent(),e.timestamp=this.lastRefreshTimestamp,t=e,[4,this.storage.save(L,t)];case 2:r.sent(),r.label=3;case 3:return[2]}}))}))},s.prototype.initialFetchToggles=function(){if(!this.isUpToDate())return this.fetchToggles();this.fetchedFromServer||(this.fetchedFromServer=!0,this.setReady())},s.prototype.fetchToggles=function(){return n(this,void 0,void 0,(function(){var t,e,r,n,o,s,a,c,l;return i(this,(function(i){switch(i.label){case 0:if(!this.fetch)return[3,9];this.abortController&&!this.abortController.signal.aborted&&this.abortController.abort(),this.abortController=null===(l=this.createAbortController)||void 0===l?void 0:l.call(this),t=this.abortController?this.abortController.signal:void 0,i.label=1;case 1:return i.trys.push([1,7,8,9]),e=this.usePOSTrequests,r=e?this.url:function(t,e){var r=new URL(t.toString());return Object.entries(e).filter(u).forEach((function(t){var e=t[0],n=t[1];"properties"===e&&n?Object.entries(n).filter(u).forEach((function(t){var e=t[0],n=t[1];return r.searchParams.append("properties[".concat(e,"]"),n)})):r.searchParams.append(e,n)})),r}(this.url,this.context),n=e?"POST":"GET",o=e?JSON.stringify({context:this.context}):void 0,[4,this.fetch(r.toString(),{method:n,cache:"no-cache",headers:this.getHeaders(),body:o,signal:t})];case 2:return s=i.sent(),"error"===this.sdkState&&s.status<400&&(this.sdkState="healthy",this.emit(k.RECOVERED)),s.ok?(this.etag=s.headers.get("ETag")||"",[4,s.json()]):[3,5];case 3:return a=i.sent(),[4,this.storeToggles(a.toggles)];case 4:return i.sent(),"healthy"!==this.sdkState&&(this.sdkState="healthy"),this.fetchedFromServer||(this.fetchedFromServer=!0,this.setReady()),this.storeLastRefreshTimestamp(),[3,6];case 5:304===s.status?this.storeLastRefreshTimestamp():(console.error("Unleash: Fetching feature toggles did not have an ok response"),this.sdkState="error",this.emit(k.ERROR,{type:"HttpError",code:s.status}),this.lastError={type:"HttpError",code:s.status}),i.label=6;case 6:return[3,9];case 7:return"object"==typeof(c=i.sent())&&null!==c&&"name"in c&&"AbortError"===c.name||(console.error("Unleash: unable to fetch feature toggles",c),this.sdkState="error",this.emit(k.ERROR,{type:"fetch-toggles",error:c}),this.lastError=c),[3,9];case 8:return this.abortController=null,[7];case 9:return[2]}}))}))},s.prototype.resolveEnvironment=function(t,e){return function(t){var e=t.indexOf(":");if(-1!==e){var r=t.slice(e+1),n=r.lastIndexOf(".");if(-1!==n)return r.slice(0,n)}}(t)||e},s}(c.TinyEmitter);
 //# sourceMappingURL=main.esm.js.map
 
-;// CONCATENATED MODULE: ./src/unleash-action.ts
+;// CONCATENATED MODULE: ./build/src/unleash-action.js
 
 
 const createUnleashAction = async (options) => {
@@ -31208,6 +31578,10 @@ const createClient = (options) => {
     });
 };
 class UnleashAction {
+    unleash;
+    features;
+    variants;
+    setResult;
     constructor(options) {
         this.unleash = options.client;
         this.unleash.on('ready', () => {
@@ -31248,29 +31622,190 @@ class UnleashAction {
     }
 }
 
-;// CONCATENATED MODULE: ./src/index.ts
+;// CONCATENATED MODULE: ./build/src/unleash-admin.js
 
-
-const appName = getInput('app-name');
-const url = getInput('url');
-const clientKey = getInput('api-key');
-const context = {};
-const contextLines = getMultilineInput('context');
-contextLines?.forEach((l) => {
-    const keyVal = l.split('=');
-    context[keyVal[0]] = keyVal[1];
+const PAYLOAD_TYPES = ['string', 'json', 'csv', 'number'];
+/**
+ * Parses `flag=variant` or `flag=variant:payload` lines. Only the first `=`
+ * and the first `:` after it are separators, so payloads may contain both.
+ */
+const parseVariantAssignments = (lines) => lines.map((line) => {
+    const eq = line.indexOf('=');
+    if (eq <= 0) {
+        throw new Error(`Invalid set-variant line "${line}": expected flag=variant[:payload]`);
+    }
+    const featureName = line.slice(0, eq).trim();
+    const rest = line.slice(eq + 1);
+    const colon = rest.indexOf(':');
+    const variantName = (colon === -1 ? rest : rest.slice(0, colon)).trim();
+    if (!variantName) {
+        throw new Error(`Invalid set-variant line "${line}": variant name is empty`);
+    }
+    const payload = colon === -1 ? undefined : rest.slice(colon + 1);
+    return { featureName, variantName, payload };
 });
-const features = getMultilineInput('is-enabled');
-const variants = getMultilineInput('get-variant');
-createUnleashAction({
-    url: url,
-    clientKey: clientKey,
-    appName: appName,
-    context: context,
-    features: features,
-    variants: variants,
-    setResult: setOutput,
-}).then(() => {
+/** Accepts `https://host`, `https://host/` or `https://host/api`. */
+const normalizeAdminUrl = (url) => url.replace(/\/+$/, '').replace(/\/api$/, '');
+class UnleashAdmin {
+    options;
+    baseUrl;
+    fetchFn;
+    constructor(options) {
+        this.options = options;
+        this.baseUrl = normalizeAdminUrl(options.adminUrl);
+        this.fetchFn = options.fetchFn ?? fetch;
+    }
+    async run() {
+        const enable = this.options.enable ?? [];
+        const disable = this.options.disable ?? [];
+        const both = enable.filter((f) => disable.includes(f));
+        if (both.length > 0) {
+            throw new Error(`Flags listed in both enable and disable: ${both.join(', ')}`);
+        }
+        for (const featureName of this.options.setVariants ?? []) {
+            await this.setVariant(featureName);
+        }
+        for (const featureName of enable) {
+            await this.toggle(featureName, true);
+        }
+        for (const featureName of disable) {
+            await this.toggle(featureName, false);
+        }
+    }
+    featurePath(featureName) {
+        const { project } = this.options;
+        return `/api/admin/projects/${encodeURIComponent(project)}/features/${encodeURIComponent(featureName)}`;
+    }
+    envPath(featureName) {
+        const { environment } = this.options;
+        return `${this.featurePath(featureName)}/environments/${encodeURIComponent(environment)}`;
+    }
+    async toggle(featureName, on) {
+        const state = on ? 'on' : 'off';
+        info(`Turning ${featureName} ${state} in ${this.options.environment}.`);
+        await this.request('POST', `${this.envPath(featureName)}/${state}`);
+    }
+    async setVariant({ featureName, variantName, payload, }) {
+        await this.warnOnStrategyVariants(featureName);
+        const variant = {
+            name: variantName,
+            weight: 1000,
+            weightType: 'variable',
+            stickiness: 'default',
+        };
+        if (payload !== undefined) {
+            variant.payload = {
+                type: this.options.payloadType ?? 'string',
+                value: payload,
+            };
+        }
+        info(`Setting ${featureName} variant to ${variantName} in ${this.options.environment}.`);
+        await this.request('PUT', `${this.envPath(featureName)}/variants`, [
+            variant,
+        ]);
+    }
+    /**
+     * Strategy variants take precedence over environment variants during
+     * evaluation, so an environment variant set here would be ignored.
+     */
+    async warnOnStrategyVariants(featureName) {
+        const feature = (await this.request('GET', this.featurePath(featureName)));
+        const env = feature?.environments?.find((e) => e.name === this.options.environment);
+        if (env?.strategies?.some((s) => (s.variants?.length ?? 0) > 0)) {
+            warning(`${featureName} has strategy variants in ${this.options.environment}; they take precedence over the environment variant being set.`);
+        }
+    }
+    async request(method, path, body) {
+        const res = await this.fetchFn(`${this.baseUrl}${path}`, {
+            method,
+            headers: {
+                Authorization: this.options.adminApiKey,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+            },
+            body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            throw new Error(`Unleash Admin API ${method} ${path} failed: ${res.status} ${res.statusText} ${text}`.trim());
+        }
+        const text = await res.text();
+        return text ? JSON.parse(text) : undefined;
+    }
+}
+
+;// CONCATENATED MODULE: ./build/src/index.js
+
+
+
+const requireInputs = (purpose, names) => {
+    const missing = names.filter((n) => !getInput(n));
+    if (missing.length > 0) {
+        throw new Error(`${purpose} requires inputs: ${missing.join(', ')}`);
+    }
+};
+const runSet = async () => {
+    const enable = getMultilineInput('enable');
+    const disable = getMultilineInput('disable');
+    const setVariants = parseVariantAssignments(getMultilineInput('set-variant'));
+    if (enable.length + disable.length + setVariants.length === 0) {
+        return;
+    }
+    requireInputs('enable/disable/set-variant', [
+        'admin-url',
+        'admin-api-key',
+        'environment',
+    ]);
+    const payloadType = (getInput('variant-payload-type') ||
+        'string');
+    if (!PAYLOAD_TYPES.includes(payloadType)) {
+        throw new Error(`variant-payload-type must be one of: ${PAYLOAD_TYPES.join(', ')}`);
+    }
+    await new UnleashAdmin({
+        adminUrl: getInput('admin-url'),
+        adminApiKey: getInput('admin-api-key'),
+        project: getInput('project') || 'default',
+        environment: getInput('environment'),
+        enable,
+        disable,
+        setVariants,
+        payloadType,
+    }).run();
+};
+const runGet = async () => {
+    const features = getMultilineInput('is-enabled');
+    const variants = getMultilineInput('get-variant');
+    const url = getInput('url');
+    const clientKey = getInput('api-key');
+    if (!url && !clientKey && features.length + variants.length === 0) {
+        return;
+    }
+    requireInputs('is-enabled/get-variant', ['app-name', 'url', 'api-key']);
+    const context = {};
+    getMultilineInput('context').forEach((l) => {
+        const eq = l.indexOf('=');
+        if (eq === -1) {
+            context[l] = '';
+            return;
+        }
+        context[l.slice(0, eq)] = l.slice(eq + 1);
+    });
+    await createUnleashAction({
+        url,
+        clientKey,
+        appName: getInput('app-name'),
+        context,
+        features,
+        variants,
+        setResult: setOutput,
+    });
+};
+const main = async () => {
+    await runSet();
+    await runGet();
     info('Done!');
+};
+main().catch((err) => {
+    setFailed(err instanceof Error ? err.message : String(err));
 });
 
